@@ -1,0 +1,26 @@
+## 22.07.2025
+- [ ] Learn SNN
+- [ ] SpikeGPT
+- [ ] SpikeLLM
+- [ ] Gemma3
+- [ ] Qwen3
+- [ ] Llama3.1
+- [ ] Llama3.2
+
+- [ ] sliding window attention
+- [ ] experiment: MoE 2 experts
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
+- [ ] 
