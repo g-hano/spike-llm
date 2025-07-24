@@ -49,10 +49,10 @@ vocab_size = tokenizer.vocab_size
 # Model Init
 model = SpikingMoELLM(
     vocab_size=vocab_size+1,
-    d_model=512,
-    n_heads=8,
-    n_kv_heads=4,
-    num_layers=4,
+    d_model=2048,
+    n_heads=16,
+    n_kv_heads=8,
+    num_layers=24,
     max_seq_len=512,
     beta=0.95,
     num_experts=4,
