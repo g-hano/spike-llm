@@ -71,7 +71,7 @@ else:
     batch_size = 2
 
 # Data - Fixed text loading
-with open(r"taylorswift.txt", 'r', encoding='utf-8') as f:
+with open(r"project\data\taylorswift.txt", 'r', encoding='utf-8') as f:
     texts = f.read()
 
 dataset = TextDataset(texts, tokenizer)
