@@ -7,7 +7,7 @@ def swish(x1):
     return x1 * torch.sigmoid(x1)
 
 class SwiGLU(nn.Module):
-    def __init__(self, input_dim, hidden_dim, dtype=torch.float32, device="cuda"):
+    def __init__(self, input_dim, hidden_dim, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.fc = nn.Linear(input_dim, hidden_dim*2, dtype=dtype, device=device) # times(2) because will chunk into 2
         self.out = nn.Linear(hidden_dim, input_dim, dtype=dtype, device=device)
@@ -20,15 +20,25 @@ class SwiGLU(nn.Module):
         return self.out(gated)
 
 class SpikingSwiGLU(nn.Module):
-    def __init__(self, input_dim, hidden_dim, beta=0.95, dtype=torch.float32, device="cuda"):
+    def __init__(self, input_dim, hidden_dim, beta=0.95, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.swiglu = SwiGLU(input_dim, hidden_dim, dtype=dtype, device=device)
-        self.lif = snn.Leaky(beta=beta, init_hidden=True)
+        self.lif = snn.Leaky(beta=beta)
+        self.mem = None
     
-    def forward(self, x):   
+    def forward(self, x):
+        if self.mem is None:
+            self.mem = self.lif.reset_mem()
+
         x = self.swiglu(x)
-        spk = self.lif(x)
+
+        spk, mem = self.lif(x, self.mem)
+
+        self.mem = mem.detach() if isinstance(mem, torch.Tensor) else mem
         return spk
+
+    def reset_mem(self):
+        self.mem = None
 
 def rotate_half(x):
     half = x.shape[-1] // 2
@@ -49,7 +59,7 @@ def apply_rope(q, k, cos, sin):
     return q_rotated, k_rotated
 
 class RoPE(nn.Module):
-    def __init__(self, head_dim, max_seq_len, theta=10_000, dtype=torch.float32, device="cuda"):
+    def __init__(self, head_dim, max_seq_len, theta=10_000, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
@@ -82,77 +92,8 @@ def get_local_attn_mask(seq_len, window_size, device="cuda"):
         mask[i, start:i+1] = 1  # causal: include i only up to itself
     return mask  # [seq_len, seq_len]
 
-'''
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, bias=False, dtype=torch.float32, device="cuda"):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.head_dim = head_dim or d_model // n_heads
-
-        assert n_heads % n_kv_heads == 0, f"{n_heads=} must be divisible by {n_kv_heads=}"
-        self.n_groups = n_heads // n_kv_heads
-
-        self.scale = self.head_dim ** -0.5
-
-        self.q_proj = nn.Linear(d_model, n_heads*self.head_dim, bias=bias, dtype=dtype, device=device)
-        self.k_proj = nn.Linear(d_model, n_kv_heads*self.head_dim, bias=bias, dtype=dtype, device=device)
-        self.v_proj = nn.Linear(d_model, n_kv_heads*self.head_dim, bias=bias, dtype=dtype, device=device)
-        self.o_proj = nn.Linear(n_heads*self.head_dim, d_model, bias=bias, dtype=dtype, device=device)
-        
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask=None, past_key_value=None, use_cache=False, rope=None):
-        batch_size, seq_len, _ = x.shape
-
-        q = self.q_proj(x) # [batch, seq_len, n_heads*head_dim]
-        k = self.k_proj(x) # [batch, seq_len, n_kv_heads*head_dim]
-        v = self.v_proj(x) # [batch, seq_len, n_kv_heads*head_dim]
-
-        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-
-        if rope is not None:
-            # RoPE expects [batch, seq_len, n_heads, head_dim], so transpose back temporarily
-            cos, sin = rope(q.transpose(1, 2), seq_len=seq_len)
-            q_rope = q.transpose(1, 2)
-            k_rope = k.transpose(1, 2)
-            q_rope, k_rope = apply_rope(q_rope, k_rope, cos, sin)
-            q = q_rope.transpose(1, 2)
-            k = k_rope.transpose(1, 2)
-            
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-            k = torch.cat([past_k, k], dim=-2)
-            v = torch.cat([past_v, v], dim=-2)
-    
-        present_key_value = (k, v) if use_cache else None
-
-        # Expand K,V to match Q heads by repeating each KV head n_groups times
-        # [batch, n_kv_heads, seq_len, head_dim] -> [batch, n_heads, seq_len, head_dim]
-        k = k.repeat_interleave(self.n_groups, dim=1)
-        v = v.repeat_interleave(self.n_groups, dim=1)
-
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        if mask is not None:
-            scores = scores.masked_fill(mask==0, float('-inf'))
-        
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        out = torch.matmul(attn_weights, v) # [b, h, s, d]
-
-        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.n_heads*self.head_dim)
-        
-        out = self.o_proj(out)
-        return out, present_key_value
-'''
-
-class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, bias=False, dtype=torch.float32, device="cuda"):
+    def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, bias=False, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -232,17 +173,18 @@ class GroupedQueryAttention(nn.Module):
 class SpikingGroupedSlidingAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, 
                  max_seq_len=2048, rope_theta_local=1e4, rope_theta_global=1e6, window_size=128, beta=0.95,
-                 dtype=torch.float32, device="cuda"):
+                 dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         
         self.local_rope = RoPE(head_dim or d_model//n_heads, max_seq_len, theta=rope_theta_local, dtype=dtype, device=device)
         self.global_rope = RoPE(head_dim or d_model//n_heads, max_seq_len, theta=rope_theta_global, dtype=dtype, device=device)
 
         self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout, dtype=dtype, device=device)
-        self.spike = snn.Leaky(beta=beta, init_hidden=True)
-        
+        self.spike = snn.Leaky(beta=beta)
+        self.spike_mem = None
+
         self.window_size = window_size
-    
+
     def get_causal_mask(self, seq_len, device, is_global, kv_len=None):
         kv_len = kv_len or seq_len
 
@@ -257,6 +199,9 @@ class SpikingGroupedSlidingAttention(nn.Module):
     def forward(self, x, use_cache=False, past_key_value=None, layer_idx=0):
         batch_size, seq_len, _ = x.shape
 
+        if self.spike_mem is None:
+            self.spike_mem = self.spike.reset_mem()
+
         kv_len = seq_len
         if past_key_value is not None:
             kv_len += past_key_value[0].size(2)  # shape: [B, H, past_len, D]
@@ -267,11 +212,18 @@ class SpikingGroupedSlidingAttention(nn.Module):
 
         rope = self.global_rope if is_global else self.local_rope
         out, present_kv = self.attn(x, mask=mask, past_key_value=past_key_value, use_cache=use_cache, rope=rope)
-        spk_out = self.spike(out)
+        
+        spk_out, spike_mem = self.spike(out, self.spike_mem)
+        
+        self.spike_mem = spike_mem.detach() if isinstance(spike_mem, torch.Tensor) else spike_mem
+        
         return spk_out, present_kv
 
+    def reset_mem(self):
+        self.spike_mem = None
+        
 class PreRMSNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-5, dtype=torch.float32, device="cuda"):
+    def __init__(self, d_model, eps=1e-5, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(d_model, dtype=dtype, device=device))
         self.eps = eps
