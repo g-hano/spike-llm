@@ -15,7 +15,7 @@ import os, json
 #wandb.init(
 #    project="spiking-llm-training-local",
 #)
-login("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")
+login("hf_XXX")
 
 REPO_NAME = f"Chan-Y/spiking-llm-{date.today()}-{datetime.now()}"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -82,7 +82,7 @@ model = SpikingLLM(**dense_config_400m).to(DEVICE)
 
 #model = torch.compile(model)
 
-texts = open(r"C:/Users/Cihan/Desktop/snn/project/data/taylorswift.txt").read()
+texts = open("taylorswift.txt").read()
 dataset = TextDataset(texts, tokenizer)
 loader = DataLoader(dataset, batch_size=4, shuffle=True)
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4)
