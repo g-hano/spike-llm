@@ -86,6 +86,7 @@ def get_local_attn_mask(seq_len, window_size, device="cuda"):
         mask[i, start:i+1] = 1  # causal: include i only up to itself
     return mask  # [seq_len, seq_len]
 
+'''
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, bias=False, dtype=torch.float32, device="cuda"):
         super().__init__()
@@ -150,6 +151,85 @@ class GroupedQueryAttention(nn.Module):
 
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.n_heads*self.head_dim)
         
+        out = self.o_proj(out)
+        return out, present_key_value
+'''
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, bias=False, dtype=torch.float32, device="cuda"):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim or d_model // n_heads
+
+        assert n_heads % n_kv_heads == 0, f"{n_heads=} must be divisible by {n_kv_heads=}"
+        self.n_groups = n_heads // n_kv_heads
+
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(d_model, n_heads*self.head_dim, bias=bias, dtype=dtype, device=device)
+        self.k_proj = nn.Linear(d_model, n_kv_heads*self.head_dim, bias=bias, dtype=dtype, device=device)
+        self.v_proj = nn.Linear(d_model, n_kv_heads*self.head_dim, bias=bias, dtype=dtype, device=device)
+        self.o_proj = nn.Linear(n_heads*self.head_dim, d_model, bias=bias, dtype=dtype, device=device)
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None, past_key_value=None, use_cache=False, rope=None):
+        batch_size, seq_len, _ = x.shape
+
+        q = self.q_proj(x) # [batch, seq_len, n_heads*head_dim]
+        k = self.k_proj(x) # [batch, seq_len, n_kv_heads*head_dim]
+        v = self.v_proj(x) # [batch, seq_len, n_kv_heads*head_dim]
+
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+
+        if rope is not None:
+            cos, sin = rope(q, seq_len)
+            q, k = apply_rope(q, k, cos, sin)
+        
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=1)
+            v = torch.cat([past_v, v], dim=1)
+        
+        present_key_value = (k, v) if use_cache else None
+        kv_seq_len = k.size(1)
+
+        if self.n_groups > 1:
+            k = k.repeat_interleave(self.n_groups, dim=2)
+            v = v.repeat_interleave(self.n_groups, dim=2)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if mask is None:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout,
+                is_causal=True,
+                scale=None
+            )
+        else:
+            if mask.dtype == torch.bool:
+                attn_mask = torch.zeros_like(mask, dtype=q.dtype)
+                attn_mask.masked_fill_(mask.logical_not(), float('-inf'))
+            else:
+                attn_mask = mask
+            
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+                scale=None
+            )
+
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.n_heads*self.head_dim)
         out = self.o_proj(out)
         return out, present_key_value
 
