@@ -15,7 +15,7 @@ import os, json
 #wandb.init(
 #    project="spiking-llm-training-local",
 #)
-login("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")
+login("")
 
 REPO_NAME = f"Chan-Y/spiking-llm-{date.today()}-{datetime.now()}"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
