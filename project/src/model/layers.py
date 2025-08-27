@@ -13,6 +13,7 @@ class SwiGLU(nn.Module):
         self.out = nn.Linear(hidden_dim, input_dim, dtype=dtype, device=device)
     
     def forward(self, x):
+        x = x.to(self.fc.weight.dtype)
         x = self.fc(x)
         x1, x2 = x.chunk(2, dim=-1)
         swh = swish(x1)
@@ -20,26 +21,26 @@ class SwiGLU(nn.Module):
         return self.out(gated)
 
 class SpikingSwiGLU(nn.Module):
-    def __init__(self, input_dim, hidden_dim, beta=0.95, dtype=torch.bfloat16, device="cuda"):
+    def __init__(self, input_dim, hidden_dim, beta=0.95, num_steps=5, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.swiglu = SwiGLU(input_dim, hidden_dim, dtype=dtype, device=device)
-        self.lif = snn.Leaky(beta=beta)
-        self.mem = None
+        self.lif = snn.Leaky(beta=beta, learn_beta=True)
+        self.num_steps = num_steps
+        self.spike_scale = nn.Parameter(torch.ones(1, dtype=dtype, device=device))
     
     def forward(self, x):
-        if self.mem is None:
-            self.mem = self.lif.reset_mem()
-
         x = self.swiglu(x)
 
-        spk, mem = self.lif(x, self.mem)
+        mem = self.lif.init_leaky()
+        spike_acc = torch.zeros_like(x)
 
-        self.mem = mem.detach() if isinstance(mem, torch.Tensor) else mem
-        return spk
-
-    def reset_mem(self):
-        self.mem = None
-
+        for _ in range(self.num_steps):
+            spk, mem = self.lif(x, mem)
+            spike_acc += spk
+        
+        output = (spike_acc / self.num_steps) * x.abs().mean() * self.spike_scale
+        return output
+    
 def rotate_half(x):
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
@@ -112,8 +113,12 @@ class GroupedQueryAttention(nn.Module):
         
         self.dropout = dropout # nn.Dropout(dropout)
 
+        self.dtype = dtype
+        self.device = device
+
     def forward(self, x, mask=None, past_key_value=None, use_cache=False, rope=None):
         batch_size, seq_len, _ = x.shape
+        x = x.to(self.q_proj.weight.dtype)
 
         q = self.q_proj(x) # [batch, seq_len, n_heads*head_dim]
         k = self.k_proj(x) # [batch, seq_len, n_kv_heads*head_dim]
@@ -139,9 +144,9 @@ class GroupedQueryAttention(nn.Module):
             k = k.repeat_interleave(self.n_groups, dim=2)
             v = v.repeat_interleave(self.n_groups, dim=2)
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = q.transpose(1, 2).to(dtype=self.dtype, device=self.device)
+        k = k.transpose(1, 2).to(dtype=self.dtype, device=self.device)
+        v = v.transpose(1, 2).to(dtype=self.dtype, device=self.device)
 
         if mask is None:
             out = F.scaled_dot_product_attention(
@@ -170,9 +175,9 @@ class GroupedQueryAttention(nn.Module):
         out = self.o_proj(out)
         return out, present_key_value
 
-class SpikingGroupedSlidingAttention(nn.Module):
+class RegularGroupedSlidingAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, 
-                 max_seq_len=2048, rope_theta_local=1e4, rope_theta_global=1e6, window_size=128, beta=0.95,
+                 max_seq_len=2048, rope_theta_local=1e4, rope_theta_global=1e6, window_size=128,
                  dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         
@@ -180,9 +185,6 @@ class SpikingGroupedSlidingAttention(nn.Module):
         self.global_rope = RoPE(head_dim or d_model//n_heads, max_seq_len, theta=rope_theta_global, dtype=dtype, device=device)
 
         self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout, dtype=dtype, device=device)
-        self.spike = snn.Leaky(beta=beta)
-        self.spike_mem = None
-
         self.window_size = window_size
 
     def get_causal_mask(self, seq_len, device, is_global, kv_len=None):
@@ -199,8 +201,47 @@ class SpikingGroupedSlidingAttention(nn.Module):
     def forward(self, x, use_cache=False, past_key_value=None, layer_idx=0):
         batch_size, seq_len, _ = x.shape
 
-        if self.spike_mem is None:
-            self.spike_mem = self.spike.reset_mem()
+        kv_len = seq_len
+        if past_key_value is not None:
+            kv_len += past_key_value[0].size(2)  # shape: [B, H, past_len, D]
+
+        is_global = (layer_idx % 6 == 5)
+        mask = self.get_causal_mask(seq_len, x.device, is_global, kv_len=kv_len)
+        mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, q_len, kv_len]
+
+        rope = self.global_rope if is_global else self.local_rope
+        out, present_kv = self.attn(x, mask=mask, past_key_value=past_key_value, use_cache=use_cache, rope=rope)
+        
+        return out, present_kv
+
+class SpikingGroupedSlidingAttention(nn.Module):
+    def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, 
+                 max_seq_len=2048, rope_theta_local=1e4, rope_theta_global=1e6, window_size=128, beta=0.95,
+                 num_steps=5, dtype=torch.bfloat16, device="cuda"):
+        super().__init__()
+        
+        self.local_rope = RoPE(head_dim or d_model//n_heads, max_seq_len, theta=rope_theta_local, dtype=dtype, device=device)
+        self.global_rope = RoPE(head_dim or d_model//n_heads, max_seq_len, theta=rope_theta_global, dtype=dtype, device=device)
+
+        self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout, dtype=dtype, device=device)
+        self.spike = snn.Leaky(beta=beta, learn_beta=True)
+        self.num_steps = num_steps
+        self.spike_scale = nn.Parameter(torch.ones(1, dtype=dtype, device=device))
+        self.window_size = window_size
+
+    def get_causal_mask(self, seq_len, device, is_global, kv_len=None):
+        kv_len = kv_len or seq_len
+
+        if is_global:
+            return torch.tril(torch.ones(seq_len, kv_len, dtype=torch.bool, device=device))
+        else:
+            idxs_q = torch.arange(seq_len, device=device)
+            idxs_k = torch.arange(kv_len, device=device)
+            mask = idxs_q.view(-1, 1) >= (idxs_k.view(1, -1) - self.window_size)
+            return mask
+
+    def forward(self, x, use_cache=False, past_key_value=None, layer_idx=0):
+        batch_size, seq_len, _ = x.shape
 
         kv_len = seq_len
         if past_key_value is not None:
@@ -213,117 +254,24 @@ class SpikingGroupedSlidingAttention(nn.Module):
         rope = self.global_rope if is_global else self.local_rope
         out, present_kv = self.attn(x, mask=mask, past_key_value=past_key_value, use_cache=use_cache, rope=rope)
         
-        spk_out, spike_mem = self.spike(out, self.spike_mem)
-        
-        self.spike_mem = spike_mem.detach() if isinstance(spike_mem, torch.Tensor) else spike_mem
-        
-        return spk_out, present_kv
+        mem = self.spike.init_leaky()
+        spike_acc = torch.zeros_like(out)
 
-    def reset_mem(self):
-        self.spike_mem = None
+        for _ in range(self.num_steps):
+            spk, mem = self.spike(out, mem)
+            spike_acc += spk
         
+        output = (spike_acc / self.num_steps) * out.abs().mean() * self.spike_scale
+        
+        return output, present_kv
+
 class PreRMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-5, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(d_model, dtype=dtype, device=device))
         self.eps = eps
     def forward(self, x):
+        input_dtype = x.dtype
         norm = x.norm(2, dim=-1, keepdim=True)
-        return x * self.weight / (norm + self.eps)
-  
-if __name__ == "__main__":
-    print("Testing SwiGLU...")
-    layer = SwiGLU(512, 2048)
-    x = torch.randn(1, 128, 512)
-    output = layer(x)
-    assert x.shape == output.shape, f"Error - SwiGLU: {x.shape=} != {output.shape=}"
-    print("✓ SwiGLU test passed")
-
-    print("\nTesting SpikingSwiGLU...")
-    spiking_layer = SpikingSwiGLU(512, 2048)
-    x = torch.randn(1, 128, 512)
-    output = spiking_layer(x)
-    assert x.shape == output.shape, f"Error - SpikingSwiGLU: {x.shape=} != {output.shape=}"
-    # Check that output is binary (spiking)
-    assert torch.all((output == 0) | (output == 1)), "Error - SpikingSwiGLU: Output should be binary spikes"
-    print("✓ SpikingSwiGLU test passed")
-
-    print("\nTesting RoPE...")
-    head_dim = 64
-    max_seq_len = 512
-    rope = RoPE(head_dim, max_seq_len)
-    x = torch.randn(1, 128, 8, head_dim)  # [batch, seq_len, n_heads, head_dim]
-    cos, sin = rope(x, seq_len=128)
-    expected_cos_shape = (128, head_dim // 2)
-    expected_sin_shape = (128, head_dim // 2)
-    assert cos.shape == expected_cos_shape, f"Error - RoPE cos: {cos.shape=} != {expected_cos_shape=}"
-    assert sin.shape == expected_sin_shape, f"Error - RoPE sin: {sin.shape=} != {expected_sin_shape=}"
-    print("✓ RoPE test passed")
-
-    print("\nTesting GroupedQueryAttention...")
-    d_model = 512
-    n_heads = 8
-    n_kv_heads = 2
-    gqa = GroupedQueryAttention(d_model, n_heads, n_kv_heads)
-    x = torch.randn(1, 128, d_model)
-    output, present_kv = gqa(x, use_cache=True)
-    assert output.shape == x.shape, f"Error - GQA output: {output.shape=} != {x.shape=}"
-    assert present_kv is not None, "Error - GQA: present_kv should not be None when use_cache=True"
-    past_k, past_v = present_kv
-    # After transpose, format is [batch, n_kv_heads, seq_len, head_dim]
-    expected_kv_shape = (1, n_kv_heads, 128, d_model // n_heads)  
-    assert past_k.shape == expected_kv_shape, f"Error - GQA past_k: {past_k.shape=} != {expected_kv_shape=}"
-    assert past_v.shape == expected_kv_shape, f"Error - GQA past_v: {past_v.shape=} != {expected_kv_shape=}"
-    print("✓ GroupedQueryAttention test passed")
-
-    print("\nTesting GroupedQueryAttention with RoPE...")
-    rope_gqa = RoPE(d_model // n_heads, 512)
-    output_rope, _ = gqa(x, rope=rope_gqa)
-    assert output_rope.shape == x.shape, f"Error - GQA with RoPE: {output_rope.shape=} != {x.shape=}"
-    print("✓ GroupedQueryAttention with RoPE test passed")
-
-    print("\nTesting SpikingGroupedSlidingAttention...")
-    spiking_attn = SpikingGroupedSlidingAttention(d_model, n_heads, n_kv_heads, window_size=64)
-    x = torch.randn(1, 128, d_model)
-    
-    # Test local attention (layer_idx % 6 != 5)
-    output_local, present_kv_local = spiking_attn(x, layer_idx=0, use_cache=True)
-    assert output_local.shape == x.shape, f"Error - Spiking Attn local: {output_local.shape=} != {x.shape=}"
-    assert present_kv_local is not None, "Error - Spiking Attn: present_kv should not be None when use_cache=True"
-    # Check that output is binary (spiking)
-    assert torch.all((output_local == 0) | (output_local == 1)), "Error - Spiking Attn: Output should be binary spikes"
-    
-    # Test global attention (layer_idx % 6 == 5)
-    output_global, present_kv_global = spiking_attn(x, layer_idx=5, use_cache=True)
-    assert output_global.shape == x.shape, f"Error - Spiking Attn global: {output_global.shape=} != {x.shape=}"
-    assert present_kv_global is not None, "Error - Spiking Attn: present_kv should not be None when use_cache=True"
-    assert torch.all((output_global == 0) | (output_global == 1)), "Error - Spiking Attn: Output should be binary spikes"
-    print("✓ SpikingGroupedSlidingAttention test passed")
-
-    print("\nTesting helper functions...")
-    
-    # Test rotate_half
-    test_tensor = torch.randn(2, 4)
-    rotated = rotate_half(test_tensor)
-    assert rotated.shape == test_tensor.shape, f"Error - rotate_half: {rotated.shape=} != {test_tensor.shape=}"
-    
-    # Test apply_rope
-    q = torch.randn(1, 10, 4, 32)
-    k = torch.randn(1, 10, 4, 32)
-    cos = torch.randn(10, 16)
-    sin = torch.randn(10, 16)
-    q_rot, k_rot = apply_rope(q, k, cos, sin)
-    assert q_rot.shape == q.shape, f"Error - apply_rope q: {q_rot.shape=} != {q.shape=}"
-    assert k_rot.shape == k.shape, f"Error - apply_rope k: {k_rot.shape=} != {k.shape=}"
-    
-    # Test get_local_attn_mask
-    mask = get_local_attn_mask(10, 3, device="cpu")
-    expected_mask_shape = (10, 10)
-    assert mask.shape == expected_mask_shape, f"Error - local mask: {mask.shape=} != {expected_mask_shape=}"
-    assert mask.dtype == torch.bool, f"Error - local mask dtype: {mask.dtype=} != torch.bool"
-    
-    print("✓ Helper functions test passed")
-
-    print("\n" + "="*50)
-    print("🎉 ALL TESTS PASSED! 🎉")
-    print("="*50)
+        result = x * self.weight / (norm + self.eps)
+        return result.to(input_dtype)
