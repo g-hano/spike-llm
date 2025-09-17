@@ -26,21 +26,32 @@ class SpikingSwiGLU(nn.Module):
         self.swiglu = SwiGLU(input_dim, hidden_dim, dtype=dtype, device=device)
         self.lif = snn.Leaky(beta=beta, learn_beta=True)
         self.num_steps = num_steps
-        self.spike_scale = nn.Parameter(torch.ones(1, dtype=dtype, device=device))
+        
+        self.spike_scale = nn.Parameter(torch.tensor(1.0, dtype=dtype, device=device))
+        self.register_buffer('running_mean', torch.tensor(1.0, dtype=dtype, device=device))
+        self.momentum = 0.9
     
     def forward(self, x):
         x = self.swiglu(x)
 
         mem = self.lif.init_leaky()
+        mem = mem.to(x.device)
         spike_acc = torch.zeros_like(x)
 
         for _ in range(self.num_steps):
             spk, mem = self.lif(x, mem)
             spike_acc += spk
         
-        output = (spike_acc / self.num_steps) * x.abs().mean() * self.spike_scale
+        spike_rate = spike_acc / self.num_steps
+        with torch.no_grad():
+            if self.training:
+                current_mean = x.abs().mean()
+                self.running_mean.mul_(self.momentum).add_(current_mean, alpha=1-self.momentum)
+        
+        # Use running mean for stable scaling
+        output = spike_rate * self.running_mean * self.spike_scale
         return output
-    
+
 def rotate_half(x):
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
@@ -86,12 +97,16 @@ class RoPE(nn.Module):
             self.max_seq_len = seq_len
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
-def get_local_attn_mask(seq_len, window_size, device="cuda"):
-    mask = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bool)
-    for i in range(seq_len):
-        start = max(0, i - window_size)
-        mask[i, start:i+1] = 1  # causal: include i only up to itself
-    return mask  # [seq_len, seq_len]
+def get_local_attn_mask(seq_len, window_size, device="cuda", kv_len=None):
+    kv_len = kv_len or seq_len
+
+    q_pos = torch.arange(seq_len, device=device).unsqueeze(1)
+    k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+
+    causal_mask = q_pos >= k_pos
+    window_mask = (q_pos - k_pos) <= window_size
+    combined_mask = causal_mask & window_mask
+    return combined_mask
 
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, bias=False, dtype=torch.bfloat16, device="cuda"):
@@ -111,8 +126,7 @@ class GroupedQueryAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, n_kv_heads*self.head_dim, bias=bias, dtype=dtype, device=device)
         self.o_proj = nn.Linear(n_heads*self.head_dim, d_model, bias=bias, dtype=dtype, device=device)
         
-        self.dropout = dropout # nn.Dropout(dropout)
-
+        self.dropout = dropout
         self.dtype = dtype
         self.device = device
 
@@ -134,11 +148,13 @@ class GroupedQueryAttention(nn.Module):
         
         if past_key_value is not None:
             past_k, past_v = past_key_value
-            k = torch.cat([past_k, k], dim=1)
-            v = torch.cat([past_v, v], dim=1)
+            if past_k.dim() == 4:
+                k = torch.cat([past_k, k], dim=1)
+                v = torch.cat([past_v, v], dim=1)
+            else:
+                print(f"Warning: past_k shape {past_k.shape}, current k shape {k.shape}")
         
-        present_key_value = (k, v) if use_cache else None
-        kv_seq_len = k.size(1)
+        present_key_value = (k.clone(), v.clone()) if use_cache else None
 
         if self.n_groups > 1:
             k = k.repeat_interleave(self.n_groups, dim=2)
@@ -152,7 +168,7 @@ class GroupedQueryAttention(nn.Module):
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None,
-                dropout_p=self.dropout,
+                dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True,
                 scale=None
             )
@@ -163,6 +179,11 @@ class GroupedQueryAttention(nn.Module):
             else:
                 attn_mask = mask
             
+            if attn_mask.dim() == 2:
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, q_len, kv_len]
+            elif attn_mask.dim() == 3:
+                attn_mask = attn_mask.unsqueeze(1)  # [B, 1, q_len, kv_len]
+
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
@@ -214,64 +235,92 @@ class RegularGroupedSlidingAttention(nn.Module):
         
         return out, present_kv
 
-class SpikingGroupedSlidingAttention(nn.Module):
+class SpikingGroupedAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_kv_heads, head_dim=None, dropout=0.0, 
-                 max_seq_len=2048, rope_theta_local=1e4, rope_theta_global=1e6, window_size=128, beta=0.95,
-                 num_steps=5, dtype=torch.bfloat16, device="cuda"):
+                 max_seq_len=2048, rope_theta_local=1e4, rope_theta_global=1e6, 
+                 beta=0.95, num_steps=10,  # Increased num_steps
+                 dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         
-        self.local_rope = RoPE(head_dim or d_model//n_heads, max_seq_len, theta=rope_theta_local, dtype=dtype, device=device)
-        self.global_rope = RoPE(head_dim or d_model//n_heads, max_seq_len, theta=rope_theta_global, dtype=dtype, device=device)
-
-        self.attn = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout, dtype=dtype, device=device)
+        # Set head dimension if not provided
+        self.head_dim = head_dim or d_model // n_heads
+        
+        # RoPE configurations (keeping both for potential layer alternation)
+        self.local_rope = RoPE(self.head_dim, max_seq_len, theta=rope_theta_local, dtype=dtype, device=device)
+        self.global_rope = RoPE(self.head_dim, max_seq_len, theta=rope_theta_global, dtype=dtype, device=device)
+        
+        # Standard attention mechanism
+        self.attn = GroupedQueryAttention(
+            d_model, n_heads, n_kv_heads, head_dim, 
+            dropout, dtype=dtype, device=device
+        )
+        
+        # Spiking components
         self.spike = snn.Leaky(beta=beta, learn_beta=True)
-        self.num_steps = num_steps
-        self.spike_scale = nn.Parameter(torch.ones(1, dtype=dtype, device=device))
-        self.window_size = window_size
+        self.num_steps = num_steps  # Increased from 5 to 10 for better temporal integration
+        self.beta = beta
 
-    def get_causal_mask(self, seq_len, device, is_global, kv_len=None):
+    def get_causal_mask(self, seq_len, device, kv_len=None):
+        """Always return full causal mask (no sliding window)"""
         kv_len = kv_len or seq_len
-
-        if is_global:
-            return torch.tril(torch.ones(seq_len, kv_len, dtype=torch.bool, device=device))
-        else:
-            idxs_q = torch.arange(seq_len, device=device)
-            idxs_k = torch.arange(kv_len, device=device)
-            mask = idxs_q.view(-1, 1) >= (idxs_k.view(1, -1) - self.window_size)
-            return mask
+        return torch.tril(torch.ones(seq_len, kv_len, dtype=torch.bool, device=device))
 
     def forward(self, x, use_cache=False, past_key_value=None, layer_idx=0):
         batch_size, seq_len, _ = x.shape
-
         kv_len = seq_len
         if past_key_value is not None:
-            kv_len += past_key_value[0].size(2)  # shape: [B, H, past_len, D]
+            # past_key_value[0] shape: [batch_size, n_heads, past_seq_len, head_dim]
+            kv_len += past_key_value[0].size(2)
 
-        is_global = (layer_idx % 6 == 5)
-        mask = self.get_causal_mask(seq_len, x.device, is_global, kv_len=kv_len)
+        # Always use causal mask (full attention)
+        mask = self.get_causal_mask(seq_len, x.device, kv_len=kv_len)
         mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, q_len, kv_len]
-
-        rope = self.global_rope if is_global else self.local_rope
-        out, present_kv = self.attn(x, mask=mask, past_key_value=past_key_value, use_cache=use_cache, rope=rope)
         
+        # FIX: Convert input to spikes FIRST, before attention computation
         mem = self.spike.init_leaky()
-        spike_acc = torch.zeros_like(out)
-
+        spike_acc = torch.zeros_like(x)
+        
+        # Generate spike trains over time
         for _ in range(self.num_steps):
-            spk, mem = self.spike(out, mem)
+            spk, mem = self.spike(x, mem)
             spike_acc += spk
         
-        output = (spike_acc / self.num_steps) * out.abs().mean() * self.spike_scale
+        # Rate-coded representation of input
+        x_rate = spike_acc / self.num_steps
         
-        return output, present_kv
+        # Choose RoPE based on layer index (optional pattern)
+        # You can customize this pattern as needed
+        is_global = (layer_idx % 6 == 5)
+        rope = self.global_rope if is_global else self.local_rope
+        
+        # Process the rate-coded input through attention
+        out, present_kv = self.attn(
+            x_rate, 
+            mask=mask, 
+            past_key_value=past_key_value, 
+            use_cache=use_cache, 
+            rope=rope
+        )
+        
+        return out, present_kv
 
 class PreRMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-5, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(d_model, dtype=dtype, device=device))
         self.eps = eps
+        self.d_model = d_model
+    
     def forward(self, x):
         input_dtype = x.dtype
-        norm = x.norm(2, dim=-1, keepdim=True)
-        result = x * self.weight / (norm + self.eps)
-        return result.to(input_dtype)
+        input_device = x.device
+        
+        if x.device != self.weight.device:
+            x = x.to(self.weight.device)
+        
+        x_fp32 = x.float()
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        x_normed = x_fp32 * torch.rsqrt(variance + self.eps)
+        
+        result = self.weight * x_normed
+        return result.to(dtype=input_dtype, device=input_device)
